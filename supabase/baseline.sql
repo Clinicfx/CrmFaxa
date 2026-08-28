@@ -14683,7 +14683,7 @@ create index if not exists webhook_events_log_a_esvaziar_idx
 notify pgrst, 'reload schema';
 
 
--- ---- repara `system_version` criada fora da forma da 0089 (migration 0161) ----
+-- ---- repara `system_version` criada fora da forma da 0089 (migration 0202) ----
 --
 -- Achado em produção: a tabela existia com PK composta (key text, value text) —
 -- sem `id`, `current_sha`, `changelog_raw`, `agent_last_seen_at`,

@@ -1,4 +1,8 @@
--- 0161 — repara `system_version` criada fora da forma da 0089.
+-- 0202 — repara `system_version` criada fora da forma da 0089.
+--
+-- (Numerada 0161 na branch original; renumerada para 0202 no merge por colidir
+--  com 0161_outbound_zera_unread. O timestamp — identidade que o Supabase CLI
+--  usa — foi preservado, então nada re-aplica em quem já rodou.)
 --
 -- Achado em produção (VPS self-host): a tabela existia com PK composta
 -- (key text, value text) — sem `id`, `current_sha`, `changelog_raw`,
