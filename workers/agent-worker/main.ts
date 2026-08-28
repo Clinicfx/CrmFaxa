@@ -29,6 +29,7 @@ import { seedPlatformPlaybook } from '@/lib/agent-engine/agent/playbook-seed';
 import { runCronLoop } from '@/lib/agent-engine/cron/scheduler';
 import { createPool } from '@/lib/agent-engine/db/pool';
 import { runDrainLoop } from '@/lib/agent-engine/edge/crm/drain';
+import { runEventLogDrainLoop } from '@/lib/event-log/drain-loop';
 import { crmEdgeConfigFromEnv } from '@/lib/agent-engine/edge/crm/mcp-client';
 import { enforceHolds, sessionHealthMetrics } from '@/lib/agent-engine/edge/crm/session-watchdog';
 import { runSessionWatchdogLoop } from '@/lib/agent-engine/edge/crm/session-reconciler';
@@ -43,11 +44,13 @@ import {
   recordRunMetrics,
   type CacheAlertKnobs,
 } from '@/lib/agent-engine/obs/metrics';
+import { rodarLoopDaFila } from '@/lib/agent-engine/queue/loop';
 import {
   cancelJob,
   claimJobs,
   completeJob,
   failJob,
+  faltaParaOProximoJob,
   reapExpiredJobs,
   type JobKind,
   type JobRow,
@@ -239,6 +242,22 @@ export async function startWorker(
     loopsAbort.signal,
   );
 
+  // Handlers do event_log (mídia, branding, follow-up…) no ritmo do worker.
+  // Antes disto eles só rodavam pelo cron `event-log-drain`, 1×/min: a cadeia
+  // persist→derive de um áudio levava 103-188s contra os 45s que o drain do
+  // turno espera, e o agente respondia "não consigo ouvir" com a transcrição
+  // pronta segundos depois. O cron continua como rede de segurança — o claim
+  // otimista do `drainEventLog` torna os dois seguros em paralelo.
+  const eventLogLoop = runEventLogDrainLoop(
+    {
+      intervalMs: env.EVENT_LOG_DRAIN_INTERVAL_MS,
+      idleIntervalMs: env.EVENT_LOG_DRAIN_IDLE_INTERVAL_MS,
+      batchSize: env.EVENT_LOG_DRAIN_BATCH_SIZE,
+    },
+    log,
+    loopsAbort.signal,
+  );
+
   // Watchdog de sessão (4A-2): reconcilia channel_sessions×WAHA + redrive de
   // queued. Liga só com as credenciais do WAHA no env (sem elas: warn + off).
   const sessionWatchdogLoop =
@@ -343,24 +362,25 @@ export async function startWorker(
     }
   };
 
-  const workerLoop = (async () => {
-    while (!shuttingDown) {
-      let claimed: JobRow[] = [];
-      try {
-        claimed = await claimJobs(pool, { workerId, maxConcurrency: env.QUEUE_MAX_CONCURRENCY });
-      } catch (err) {
-        log.error('claim falhou', { error: errMsg(err) });
-      }
-      for (const job of claimed) {
+  const workerLoop = rodarLoopDaFila<JobRow>({
+    relogio: () => faltaParaOProximoJob(pool),
+    claimar: () => claimJobs(pool, { workerId, maxConcurrency: env.QUEUE_MAX_CONCURRENCY }),
+    aoClaimar: (jobs) => {
+      for (const job of jobs) {
         const running = runJob(job);
         inFlight.add(running);
         void running.finally(() => inFlight.delete(running));
       }
-      if (claimed.length === 0 || shuttingDown) {
-        await sleep(env.QUEUE_POLL_INTERVAL_MS);
-      }
-    }
-  })();
+    },
+    // O `{ signal }` é o que faz o `docker stop` não esperar a espera inteira —
+    // e é por isso que `rodarLoopDaFila` trata a rejeição em vez de propagá-la:
+    // `sleep` abortado REJEITA, e essa rejeição chegaria ao `await workerLoop`
+    // logo abaixo, matando o processo antes do drain dos jobs em voo.
+    dormir: (ms) => sleep(ms, undefined, { signal: loopsAbort.signal }),
+    deveParar: () => shuttingDown,
+    intervalos: { ociosoMs: env.QUEUE_POLL_INTERVAL_MS, retryMs: env.QUEUE_CLAIM_RETRY_INTERVAL_MS },
+    log,
+  });
 
   let resolveStopped!: () => void;
   const stopped = new Promise<void>((resolve) => {
@@ -379,7 +399,7 @@ export async function startWorker(
     server.close();
     server.closeIdleConnections();
     loopsAbort.abort();
-    await Promise.all([drainLoop, healthLoop, cronLoop, sessionWatchdogLoop, flywheelLoop]);
+    await Promise.all([drainLoop, eventLogLoop, healthLoop, cronLoop, sessionWatchdogLoop, flywheelLoop]);
     await workerLoop;
     let graceTimer: NodeJS.Timeout | undefined;
     const grace = new Promise<'grace'>((resolve) => {
@@ -405,11 +425,28 @@ export async function startWorker(
   process.once('SIGINT', (signal) => void shutdown(signal));
 
   // A linha que a Fase 0 exige ver: worker conectado ao Supabase, schema ok, pronto.
+  // Os dois intervalos vão junto porque governam a conta de egress do banco (issue
+  // #258) e quem os ajusta precisa conseguir CONFERIR o que está em vigor sem ler
+  // o código-fonte — foi o que o autor da issue teve de fazer para achar o knob.
   log.info('agent-engine pronto', {
     worker_id: workerId,
     healthz_port: port,
     max_concurrency: env.QUEUE_MAX_CONCURRENCY,
+    poll_ocioso_ms: env.QUEUE_POLL_INTERVAL_MS,
+    claim_retry_ms: env.QUEUE_CLAIM_RETRY_INTERVAL_MS,
   });
+  // Acima de 10 s a espera ociosa passa do idleTimeoutMillis do pool (10 s, o
+  // default do pg): a conexão morre entre uma rodada e outra, e cada consulta ao
+  // relógio volta a pagar TCP+TLS+startup. Medido: 499 B por rodada depois de 12 s
+  // de sono contra 66 B depois de 2 s — subir o intervalo além daí gasta mais do
+  // que economiza. Aviso em vez de teto no schema: um `.max()` faria o worker
+  // RECUSAR subir numa máquina cujo .env já tem um valor maior, e a doutrina de
+  // packaging proíbe atualização que exija edição manual de arquivo.
+  if (env.QUEUE_POLL_INTERVAL_MS >= 10_000) {
+    log.warn('QUEUE_POLL_INTERVAL_MS ≥ 10s — cada rodada ociosa reconecta ao banco e gasta MAIS que um valor menor', {
+      poll_ocioso_ms: env.QUEUE_POLL_INTERVAL_MS,
+    });
+  }
   await stopped;
 }
 
@@ -428,6 +465,7 @@ export async function main(): Promise<void> {
       maxContextTokens: env.LEAD_CONTEXT_MAX_TOKENS,
       notesIndexMaxTokens: env.LEAD_NOTES_INDEX_MAX_TOKENS,
       maxSteps: env.AGENT_MAX_STEPS,
+      maxSendsPerTurn: env.MAX_SENDS_PER_TURN,
       queuedRetryDelayMs: env.SEND_QUEUED_RETRY_MS,
       breaker: {
         exactFailureWarn: env.TOOL_BREAKER_EXACT_WARN,

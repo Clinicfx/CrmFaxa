@@ -112,3 +112,5 @@ evidence/.sonda-score-residuo.json
 # dump gerado por scripts/backup-db.sh (default ./backups) — dado real de
 # produção, nunca versionado
 backups/
+# QA em VPS: guarda segredo TOTP da conta de teste (repo e publico)
+.qa-vps/

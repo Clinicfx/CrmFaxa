@@ -76,6 +76,83 @@ describe("o canal volta sozinho", () => {
   });
 });
 
+describe("o token atrasado: o defeito foi eliminado, não afrouxado", () => {
+  /**
+   * ESTE BLOCO GUARDAVA QUATRO CASOS QUE NÃO EXISTEM MAIS, e a razão de terem
+   * saído importa mais que os casos.
+   *
+   * Eles cobriam uma corrida: o hook buscava o token, dava `setAuth` e assinava,
+   * com teto de 4s e remontagem quando o token chegava atrasado. Toda essa
+   * engenharia existia para compensar o supabase-js não enxergar a sessão
+   * (cookie httpOnly).
+   *
+   * ⚠️ E ELA PAROU DE FUNCIONAR NUM BUMP DE DEPENDÊNCIA, com os testes verdes.
+   * Do realtime-js 2.112.x em diante a callback `accessToken` do client vence o
+   * token manual, e a callback padrão sem sessão visível devolve a ANON KEY.
+   * Medido no socket: o token do usuário durava ~2ms; o join seguinte ia
+   * anônimo. Os testes não viram porque exercitavam um cliente FAKE e
+   * afirmavam que `setAuth` fora CHAMADO — o que morreu foi o EFEITO.
+   *
+   * A fonte do token passou a ser a callback, em `lib/supabase/browser.ts`, que
+   * o socket resolve ANTES de emitir o join. Sem corrida, não há teto a vencer
+   * nem canal a remontar por atraso: a classe inteira de defeito deixou de ser
+   * representável. Quem a vigia agora é `realtime-token-do-socket.test.ts`.
+   */
+  it("a corrida com teto não voltou ao hook", () => {
+    expect(FONTE, "voltou a esperar token antes de assinar").not.toMatch(/esperarAuth/);
+    expect(FONTE, "voltou o teto da corrida de auth").not.toMatch(/AUTH_TIMEOUT_MS/);
+  });
+
+  it("o subscribe é direto — nada bloqueia o join", () => {
+    // Se o join voltar a depender de uma promessa nossa, a corrida volta junto.
+    expect(FONTE).toMatch(/novo\.subscribe\(\(s\) => \{/);
+  });
+});
+
+describe("a rede de segurança do inbox", () => {
+  /**
+   * O board e a linha do tempo já tinham; o inbox não. Com o canal morto e a
+   * aba EM FOCO, `refetchOnWindowFocus` nunca dispara — e o inbox é a tela em
+   * que se fica parado olhando. Ficava congelada até o F5, que foi o sintoma.
+   */
+  it("a lista de conversas tem rede, e devolve o sinal de perda", () => {
+    const fonte = readFileSync("hooks/inbox/useConversationsRealtime.ts", "utf8");
+    expect(fonte, "a lista ficou sem rede de segurança").toMatch(/useRefetchDeSeguranca</);
+    expect(fonte, "o sinal de perda não sai do hook").toMatch(/return \{[^}]*\bseguranca\b[^}]*\}/);
+  });
+
+  it("a conversa aberta também", () => {
+    const fonte = readFileSync("hooks/inbox/useMessagesRealtime.ts", "utf8");
+    expect(fonte, "a conversa aberta ficou sem rede de segurança").toMatch(/useRefetchDeSeguranca</);
+    expect(fonte, "o sinal de perda não sai do hook").toMatch(/return \{[^}]*\bseguranca\b[^}]*\}/);
+  });
+
+  it("o estado do canal chega à TELA — senão a morte dele segue invisível", () => {
+    // O dossiê do lead já publicava este par; o inbox não publicava nada.
+    // ⚠️ `data-realtime-status` tem de vir do STATUS do canal, não de um objeto
+    // que existe sempre: a primeira versão desta linha diria `ativo` inclusive
+    // com o canal morto — controle decorativo, que mente com cara de instrumento.
+    const tela = readFileSync("components/inbox/InboxLayout.tsx", "utf8");
+    expect(tela, "o inbox não publica o estado do canal").toMatch(
+      /data-realtime-status=\{listQ\.realtimeStatus\}/,
+    );
+    expect(tela, "o inbox não publica a contagem de perdas").toMatch(
+      /data-refetch-divergencias=\{listQ\.seguranca/,
+    );
+  });
+
+  it("a rede consome o carimbo de entrega do canal — senão só sabe reprovar", () => {
+    // Sem `ultimaEntrega`, divergência é indistinguível de "nada aconteceu no
+    // intervalo": a verificação perde a capacidade de APROVAR.
+    for (const f of ["hooks/inbox/useConversationsRealtime.ts", "hooks/inbox/useMessagesRealtime.ts"]) {
+      const fonte = readFileSync(f, "utf8");
+      expect(fonte, `${f} não passa ultimaEntrega para a rede`).toMatch(
+        /const \{[^}]*\bultimaEntrega\b[^}]*\} = useRealtimeChannel\(/,
+      );
+    }
+  });
+});
+
 describe("a segunda rede: voltar para a aba", () => {
   it("o hilo de mensagens ressincroniza ao focar", () => {
     const fonte = readFileSync("hooks/inbox/useMessagesRealtime.ts", "utf8");
@@ -85,6 +162,14 @@ describe("a segunda rede: voltar para a aba", () => {
   it("a lista de conversas também", () => {
     const fonte = readFileSync("hooks/inbox/useConversationsRealtime.ts", "utf8");
     expect(fonte).toMatch(/refetchOnWindowFocus: true/);
+  });
+
+  it("useConversationsRealtime monta UMA vez na árvore do inbox — duplicar dobra refetch", () => {
+    const layout = readFileSync("components/inbox/InboxLayout.tsx", "utf8");
+    const lista = readFileSync("components/inbox/ConversationList.tsx", "utf8");
+    expect(layout.match(/useConversationsRealtime\(/g)?.length).toBe(1);
+    expect(lista).not.toMatch(/useConversationsRealtime\(/);
+    expect(lista).toMatch(/listQuery/);
   });
 
   it("e o padrão GLOBAL segue desligado — isto é exceção, não virada de chave", () => {

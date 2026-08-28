@@ -154,6 +154,20 @@ function makeSupabase(
           },
         };
       }
+      if (table === "contacts") {
+        // O envio carimba `contacts.last_activity_at` (migration 0162). O dublê
+        // é encadeável SEM LIMITE de propósito: a consulta filtra por id E por
+        // organização (este handler também roda com o client de service role,
+        // que bypassa RLS), e um dublê que fixa a quantidade de `eq` quebra
+        // quando a consulta ganha um filtro novo — com um erro que não fala do
+        // comportamento sob teste.
+        const cadeiaContacts: Record<string, unknown> = {
+          eq: () => cadeiaContacts,
+          then: (resolve: (v: { error: null }) => unknown) =>
+            Promise.resolve({ error: null }).then(resolve),
+        };
+        return { update: () => cadeiaContacts };
+      }
       throw new Error(`fake_supabase: tabela inesperada '${table}'`);
     },
     rpc: async () => ({ error: null }),
@@ -247,7 +261,9 @@ describe('sendMessageHandler — os 6 desfechos do envio', () => {
     expect(msg.external_id).toBe('MEDIA1');
     expect(msg.ack).toBe(0);
     expect(msg.error_code).toBeNull();
-    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(`${WAHA_BASE}/api/sendImage`);
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === `${WAHA_BASE}/api/sendImage`)).toBe(
+      true,
+    );
   });
 
   it('5. texto puro: sent + external_id + ack 0, pelo endpoint de texto', async () => {
@@ -261,12 +277,13 @@ describe('sendMessageHandler — os 6 desfechos do envio', () => {
     expect(msg.external_id).toBe('TEXT1');
     expect(msg.ack).toBe(0);
     expect(msg.error_code).toBeNull();
-    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(`${WAHA_BASE}/api/sendText`);
+    const sendText = fetchMock.mock.calls.find(([url]) => String(url) === `${WAHA_BASE}/api/sendText`);
+    expect(sendText, 'sendText não foi chamado').toBeTruthy();
     // Task 7: a sessão que chega ao fio sai de `resolveSessionRef` (que escolhe a
     // COLUNA conforme o provider), não mais de um acesso direto à coluna do
     // provider legado. Sem esta linha, um resolvedor que devolva a coluna errada
     // manda `session: undefined` e a rede inteira continua verde — medido.
-    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body)) as {
+    const body = JSON.parse(String((sendText![1] as RequestInit).body)) as {
       session: string;
     };
     expect(body.session).toBe('default');

@@ -29,7 +29,10 @@ import { generateText, stepCountIs, type LanguageModel, type StopCondition, type
 
 // Fonte única do endpoint — a mesma constante que o registry de produção usa.
 // Repetir a URL aqui criaria dois lugares para consertar quando ela mudar.
-import { OPENROUTER_ENDPOINT } from "@/lib/agent-engine/edge/llm/providers";
+import {
+  cabecalhosDeAtribuicaoOpenRouter,
+  OPENROUTER_ENDPOINT,
+} from "@/lib/agent-engine/edge/llm/providers";
 import { CredentialUnavailableError, loadCredential } from "@/lib/ai/credentials";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { audit } from "@/lib/audit";
@@ -172,7 +175,11 @@ export function buildModel(provider: string, apiKey: string, modelId: string): L
     // `unsupported_provider` — enquanto a mensagem de verdade seria respondida
     // normalmente pelo worker. Erro no ensaio lê-se como produto quebrado.
     case "openrouter":
-      return createOpenAI({ apiKey, baseURL: OPENROUTER_ENDPOINT })(modelId);
+      return createOpenAI({
+        apiKey,
+        baseURL: OPENROUTER_ENDPOINT,
+        headers: cabecalhosDeAtribuicaoOpenRouter(),
+      })(modelId);
     default:
       throw new Error(`unsupported_provider: ${provider}`);
   }
@@ -254,7 +261,15 @@ export async function runAgent(input: RunAgentInput): Promise<RunAgentResult> {
     const { data: versionRaw } = await admin
       .from("ai_agent_versions")
       .select(
-        "id, organization_id, agent_id, system_prompt, provider, model, credential_id, tool_ids, channel_session_id, max_steps, token_budget, cost_budget_cents, history_message_window, history_token_window, handoff_keywords, handoff_tool_enabled, created_by",
+        // `pipeline_ids` e `knowledge_source_ids` ENTRAM no SELECT.
+        //
+        // A linha 445 lia `version.pipeline_ids` de um objeto que este SELECT
+        // nunca trouxe: o `?? []` do call site absorvia o `undefined` e o escopo
+        // ficava SEMPRE vazio neste runtime — a marcação da tela existia e não
+        // valia aqui. Coluna lida que o SELECT não pede é o defeito que
+        // `agent-version-columns-drift.test.ts` existe para pegar nas cópias
+        // vigiadas; esta não é uma delas.
+        "id, organization_id, agent_id, system_prompt, provider, model, credential_id, tool_ids, channel_session_id, max_steps, token_budget, cost_budget_cents, history_message_window, history_token_window, handoff_keywords, handoff_tool_enabled, created_by, pipeline_ids, knowledge_source_ids",
       )
       .eq("id", run.agent_version_id)
       .eq("organization_id", run.organization_id)
